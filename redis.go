@@ -59,6 +59,15 @@ type Hook interface {
 	ProcessPipelineHook(next ProcessPipelineHook) ProcessPipelineHook
 }
 
+// A ProcessHook can ask the driver to execute a single command one more time
+// by returning a *RetryableError (see NewRetryableError). The retry is driven
+// by the driver itself — the hook must not loop and resend the command — and
+// runs through the ProcessHook chain again. It is granted at most once, only
+// while the command has not received a successful reply, and never inside a
+// pipeline or MULTI/EXEC batch (a *RetryableError from a
+// ProcessPipelineHook fails the whole batch). See RetryableError for the full
+// contract.
+
 type (
 	DialHook            func(ctx context.Context, network, addr string) (net.Conn, error)
 	ProcessHook         func(ctx context.Context, cmd Cmder) error
@@ -262,11 +271,27 @@ func (hs *hooksMixin) processHook(ctx context.Context, cmd Cmder) error {
 }
 
 func (hs *hooksMixin) processPipelineHook(ctx context.Context, cmds []Cmder) error {
-	return hs.state.Load().current.pipeline(ctx, cmds)
+	err := hs.state.Load().current.pipeline(ctx, cmds)
+	// A hook can retry a SINGLE command only; a batch that has already been
+	// assembled (and may already be partially sent) cannot have one command
+	// pulled out and re-sent. The whole batch fails; commands that do not
+	// carry their own error yet inherit the hook's error.
+	if isHookRetryableError(err) {
+		setCmdsErr(cmds, err)
+	}
+	return err
 }
 
 func (hs *hooksMixin) processTxPipelineHook(ctx context.Context, cmds []Cmder) error {
-	return hs.state.Load().current.txPipeline(ctx, cmds)
+	err := hs.state.Load().current.txPipeline(ctx, cmds)
+	// MULTI/EXEC is atomic as a unit: a RetryableError from the transaction
+	// hook fails the whole transaction. A command is never retried out of the
+	// MULTI. Transport failures that leave a connection in MULTI already
+	// remove that connection in releaseConnToPool, so it is never pooled.
+	if isHookRetryableError(err) {
+		setCmdsErr(cmds, err)
+	}
+	return err
 }
 
 //------------------------------------------------------------------------------
@@ -1549,15 +1574,84 @@ func (c *baseClient) processCommand(ctx context.Context, cmd Cmder, state *proce
 	if err := c.cscCommandError(cmd); err != nil {
 		return err
 	}
+	var err error
 	if c.csc != nil && isCacheable(cmd) {
 		// A cacheable command can still reach the cached path on the full-duplex
 		// divert (retryOnNormalConn). The command spent its first attempt on the FD
 		// socket. So startAttempt must go into processCached. On a cache miss
 		// processCached runs the MaxRetries loop. If startAttempt is lost, the
 		// diverted command runs one attempt more than MaxRetries+1.
-		return c.processCached(ctx, cmd, state, startAttempt)
+		err = c.processCached(ctx, cmd, state, startAttempt)
+	} else {
+		err = c.processWithRetry(ctx, cmd, nil, state, startAttempt)
 	}
-	return c.processWithRetry(ctx, cmd, nil, state, startAttempt)
+	// Record, below the hook chain, that a successful reply was delivered. A
+	// ProcessHook can only trigger its one extra execution while this is unset;
+	// after a success the command is never sent a second time. redis.Nil is a
+	// complete negative reply, so it counts as success too.
+	if err == nil || errors.Is(err, Nil) {
+		markHookReplySucceeded(ctx)
+	}
+	return err
+}
+
+// processWithHookRetry is the single-command Process entry for every
+// non-cluster client (Client, Conn, Tx, SentinelClient). It runs the hook
+// chain and honors a RetryableError returned from a ProcessHook exactly once,
+// re-entering the hooks for the extra execution.
+//
+// The extra execution is ONE send at this, the actual command layer — it does
+// not re-run the MaxRetries network loop — so the hook retry can never
+// multiply network retries. It may land on another connection (a pooled
+// Client re-acquires from the pool; a sticky Conn/Tx keeps its connection).
+// The network-retry path itself is untouched: without a RetryableError the
+// hook chain runs once around the existing processWithRetry loop, exactly as
+// before.
+func (c *baseClient) processWithHookRetry(ctx context.Context, cmd Cmder) error {
+	// Nested inside an outer hook-retry owner (a cluster/ring node client):
+	// the outer loop owns the retry decision, so here the hook chain behaves
+	// exactly as the plain one-shot entry it used to be.
+	if hookRetryStateFromContext(ctx) != nil {
+		err := c.processHook(ctx, cmd)
+		cmd.SetErr(err)
+		return err
+	}
+	ctx, _ = withHookRetryContext(ctx)
+
+	var state processState
+	// First pass: the ordinary terminal, i.e. the existing network-retry
+	// loop with its current accounting.
+	first := func(ctx context.Context, cmd Cmder) error {
+		return c.processCommand(ctx, cmd, &state, 0)
+	}
+	// Extra pass: exactly one wire execution. attempt 0 means no backoff
+	// sleep, and there is deliberately no enclosing retry loop — one send,
+	// one reply, then the result is final.
+	once := func(ctx context.Context, cmd Cmder) error {
+		// Re-apply the same command guard the ordinary path starts with, so a
+		// hook wrapping its rejection (e.g. SELECT/AUTH under CSC) cannot
+		// smuggle the forbidden command onto a connection on the extra send.
+		if err := c.cscCommandError(cmd); err != nil {
+			return err
+		}
+		_, _, cn, err := c._process(ctx, cmd, 0, nil)
+		state.attempts++
+		if cn != nil {
+			state.lastConn = cn
+		}
+		if err != nil {
+			recordCommandError(ctx, err, cn, state.attempts-1)
+		}
+		return err
+	}
+
+	start := time.Now()
+	err := c.runHookRetryLoop(ctx, cmd, first, once)
+	if cb := otel.GetOperationDurationCallback(); cb != nil {
+		cb(ctx, time.Since(start), cmd, state.attempts, err, state.lastConn, c.opt.DB)
+	}
+	cmd.SetErr(err)
+	return err
 }
 
 // processWithRetry runs cmd through the retry loop. capture (optional) is
@@ -2725,9 +2819,7 @@ func (c *Client) conn(discardOnClose bool) *Conn {
 }
 
 func (c *Client) Process(ctx context.Context, cmd Cmder) error {
-	err := c.processHook(ctx, cmd)
-	cmd.SetErr(err)
-	return err
+	return c.processWithHookRetry(ctx, cmd)
 }
 
 // Options returns read-only *Options that were used to create the client.
@@ -3039,9 +3131,7 @@ func newConn(opt *Options, connPool pool.Pooler, parentHooks *hooksMixin, himpor
 }
 
 func (c *Conn) Process(ctx context.Context, cmd Cmder) error {
-	err := c.processHook(ctx, cmd)
-	cmd.SetErr(err)
-	return err
+	return c.processWithHookRetry(ctx, cmd)
 }
 
 // RegisterPushNotificationHandler registers a handler for a specific push notification name.

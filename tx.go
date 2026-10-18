@@ -76,9 +76,7 @@ func (c *Tx) init() {
 }
 
 func (c *Tx) Process(ctx context.Context, cmd Cmder) error {
-	err := c.processHook(ctx, cmd)
-	cmd.SetErr(err)
-	return err
+	return c.processWithHookRetry(ctx, cmd)
 }
 
 // Watch prepares a transaction and marks the keys to be watched

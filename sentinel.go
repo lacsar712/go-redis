@@ -779,9 +779,7 @@ func (c *SentinelClient) RegisterPushNotificationHandler(pushNotificationName st
 }
 
 func (c *SentinelClient) Process(ctx context.Context, cmd Cmder) error {
-	err := c.processHook(ctx, cmd)
-	cmd.SetErr(err)
-	return err
+	return c.processWithHookRetry(ctx, cmd)
 }
 
 func (c *SentinelClient) pubSub() *PubSub {

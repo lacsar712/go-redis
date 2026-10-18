@@ -1498,9 +1498,100 @@ func (c *ClusterClient) Close() error {
 }
 
 func (c *ClusterClient) Process(ctx context.Context, cmd Cmder) error {
-	err := c.processHook(ctx, cmd)
+	// Nested inside an outer hook-retry owner (this client is a node client
+	// reached from a ClusterClient/Ring loop): the outer loop owns the retry
+	// decision.
+	if hookRetryStateFromContext(ctx) != nil {
+		err := c.processHook(ctx, cmd)
+		cmd.SetErr(err)
+		return err
+	}
+	ctx, _ = withHookRetryContext(ctx)
+	err := c.runHookRetryLoop(ctx, cmd, c.process, c.hookRetryProcessOnce)
 	cmd.SetErr(err)
 	return err
+}
+
+// hookRetryProcessOnce is the terminal of the one hook-driven extra execution
+// on a cluster. It selects the node AFRESH from the command's current slot
+// against freshly loaded topology (the slot may be migrating), sends once, and
+// follows MOVED/ASK redirects exactly as process does — those mean the
+// command never executed on the node. No other (network/LOADING/...) retries
+// are taken here: this is one extra execution, and only its final result is
+// adopted.
+func (c *ClusterClient) hookRetryProcessOnce(ctx context.Context, cmd Cmder) error {
+	// Re-read topology before picking the node so a slot that migrated after
+	// the failed pass routes to its current owner. ReloadOrGet keeps the last
+	// good state when the refresh itself fails.
+	if _, err := c.state.ReloadOrGet(ctx); err != nil {
+		return err
+	}
+	slot := c.cmdSlot(cmd, -1)
+	var node *clusterNode
+	var ask bool
+	var lastErr error
+	for hop := 0; hop <= c.opt.MaxRedirects; hop++ {
+		if node == nil {
+			var err error
+			if !c.opt.DisableRoutingPolicies && c.opt.ShardPicker != nil {
+				node, err = c.cmdNodeWithShardPicker(ctx, cmd.Name(), slot, c.opt.ShardPicker)
+			} else {
+				node, err = c.cmdNode(ctx, cmd.Name(), slot)
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		if ask {
+			ask = false
+			pipe := node.Client.Pipeline()
+			_ = pipe.Process(ctx, NewCmd(ctx, "asking"))
+			_ = pipe.Process(ctx, cmd)
+			_, lastErr = pipe.Exec(ctx)
+		} else if !c.opt.DisableRoutingPolicies {
+			lastErr = c.routeAndRun(ctx, cmd, node)
+		} else {
+			lastErr = node.Client.Process(ctx, cmd)
+		}
+
+		// If there is no error - we are done.
+		if lastErr == nil {
+			return nil
+		}
+
+		// MOVED/ASK keep their existing redirect handling: follow the
+		// redirect; the command did not execute on this node, so this is not
+		// adopting a second result.
+		var addr string
+		var moved bool
+		moved, ask, addr = isMovedError(lastErr)
+		if moved || ask {
+			c.state.LazyReload()
+
+			if errorCallback := pool.GetMetricErrorCallback(); errorCallback != nil {
+				errorType := "MOVED"
+				statusCode := "MOVED"
+				if ask {
+					errorType = "ASK"
+					statusCode = "ASK"
+				}
+				errorCallback(ctx, errorType, nil, statusCode, false, 0)
+			}
+
+			var err error
+			node, err = c.nodes.GetOrCreate(addr)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Any other error ends the extra execution here; it is the final,
+		// adopted result.
+		return lastErr
+	}
+	return lastErr
 }
 
 func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
@@ -1544,9 +1635,14 @@ func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
 			}
 		}
 
-		// If there is no error - we are done.
-		if lastErr == nil {
-			return nil
+		// If there is no error - we are done. redis.Nil is a complete
+		// negative reply, not a failure.
+		if lastErr == nil || errors.Is(lastErr, Nil) {
+			// Mark below the hook chain that the command got its successful
+			// reply (including via an ASK redirect); a hook-retry is then
+			// refused so the command cannot be sent twice.
+			markHookReplySucceeded(ctx)
+			return lastErr
 		}
 		if isReadOnly := isReadOnlyError(lastErr); isReadOnly || lastErr == pool.ErrClosed {
 			if isReadOnly {

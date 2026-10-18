@@ -672,9 +672,28 @@ func (c *Ring) SetAddrs(addrs map[string]string) {
 }
 
 func (c *Ring) Process(ctx context.Context, cmd Cmder) error {
-	err := c.processHook(ctx, cmd)
+	// Nested inside an outer hook-retry owner (a shard's node client): the
+	// outer loop owns the retry decision.
+	if hookRetryStateFromContext(ctx) != nil {
+		err := c.processHook(ctx, cmd)
+		cmd.SetErr(err)
+		return err
+	}
+	ctx, _ = withHookRetryContext(ctx)
+	err := c.runHookRetryLoop(ctx, cmd, c.process, c.hookRetryProcessOnce)
 	cmd.SetErr(err)
 	return err
+}
+
+// hookRetryProcessOnce is the terminal of the one hook-driven extra execution
+// on a Ring: the shard is selected afresh (consistent hashing may have moved
+// it) and the command is sent exactly once.
+func (c *Ring) hookRetryProcessOnce(ctx context.Context, cmd Cmder) error {
+	shard, err := c.cmdShard(cmd)
+	if err != nil {
+		return err
+	}
+	return shard.Client.Process(ctx, cmd)
 }
 
 // Options returns read-only *RingOptions that were used to create the client.
@@ -870,7 +889,12 @@ func (c *Ring) process(ctx context.Context, cmd Cmder) error {
 		}
 
 		lastErr = shard.Client.Process(ctx, cmd)
-		if lastErr == nil || !shouldRetry(lastErr, cmd.readTimeout() == nil) || cmd.NoRetry() {
+		// redis.Nil is a complete negative reply, so it counts as success.
+		if lastErr == nil || errors.Is(lastErr, Nil) {
+			markHookReplySucceeded(ctx)
+			return lastErr
+		}
+		if !shouldRetry(lastErr, cmd.readTimeout() == nil) || cmd.NoRetry() {
 			return lastErr
 		}
 	}
